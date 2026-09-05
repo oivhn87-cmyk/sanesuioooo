@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>P2P Popcorn Battle (Time Limit)</title>
+  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; touch-action: none; }
+    body { background: #1a1a1a; color: #fff; font-family: sans-serif; text-align: center; overflow: hidden; }
+    #setup-screen, #result-screen {
+      position: absolute; inset: 0; background: rgba(34, 34, 34, 0.95);
+      display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 10; gap: 15px; padding: 20px;
+    }
+    #result-screen { display: none; }
+    input, button { padding: 12px 20px; font-size: 16px; border-radius: 8px; border: none; outline: none; }
+    button { background: #ff9800; color: #fff; font-weight: bold; cursor: pointer; }
+    button:active { background: #e68a00; }
+    #status { font-size: 14px; color: #aaa; margin-top: 10px; }
+    #game-container { position: relative; width: 100vw; height: 100vh; max-width: 600px; margin: 0 auto; background: #2c2c54; overflow: hidden; }
+    canvas { width: 100%; height: 100%; display: block; }
+    #hud { position: absolute; top: 10px; left: 0; right: 0; display: flex; justify-content: space-around; font-size: 20px; font-weight: bold; pointer-events: none; }
+    #timer { color: #ffeb3b; font-size: 24px; }
+  </style>
+</head>
+<body>
+
+  <div id="setup-screen">
+    <h1>🍿 ポップコーン対戦</h1>
+    <div>制限時間: 60秒</div>
+    <div id="host-section">
+      <button id="btn-create">部屋を作成 (Host)</button>
+    </div>
+    <div style="margin: 5px 0;">- OR -</div>
+    <div id="join-section">
+      <input type="text" id="join-id" placeholder="ホストIDを入力">
+      <button id="btn-join">接続 (Guest)</button>
+    </div>
+    <div id="status">通信待機中...</div>
+  </div>
+
+  <div id="result-screen">
+    <h1 id="result-title">RESULT</h1>
+    <p id="result-detail" style="font-size: 20px; margin: 15px 0;"></p>
+    <button onclick="location.reload()">もう一度遊ぶ</button>
+  </div>
+
+  <div id="game-container">
+    <div id="hud">
+      <div style="color: #ff5252;">YOU: <span id="score-self">0</span></div>
+      <div id="timer">60</div>
+      <div style="color: #448aff;">OPP: <span id="score-opp">0</span></div>
+    </div>
+    <canvas id="gameCanvas"></canvas>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const setupScreen = document.getElementById('setup-screen');
+    const resultScreen = document.getElementById('result-screen');
+    const timerEl = document.getElementById('timer');
+    
+    function resizeCanvas() {
+      canvas.width = canvas.parentElement.clientWidth;
+      canvas.height = canvas.parentElement.clientHeight;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    let peer, conn;
+    let isHost = false;
+    let myScore = 0;
+    let oppScore = 0;
+    let timeLeft = 60;
+    let gameOver = false;
+
+    const player = { x: canvas.width / 2, y: canvas.height - 60, width: 80, height: 16 };
+    const opponent = { x: canvas.width / 2, y: canvas.height - 60, width: 80, height: 16 };
+    let kernels = [];
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const targetHostId = urlParams.get('host');
+    if (targetHostId) document.getElementById('join-id').value = targetHostId;
+
+    function initPeer(id = null) {
+      peer = id ? new Peer(id) : new Peer();
+      peer.on('open', (peerId) => {
+        if (isHost) {
+          statusEl.innerHTML = `ルーム作成完了！<br>ID: <b>${peerId}</b>`;
+        } else {
+          statusEl.innerText = "接続中...";
+        }
+      });
+      peer.on('connection', (c) => {
+        conn = c;
+        setupDataConnection();
+      });
+    }
+
+    document.getElementById('btn-create').addEventListener('click', () => { isHost = true; initPeer(); });
+    document.getElementById('btn-join').addEventListener('click', () => {
+      const hostId = document.getElementById('join-id').value.trim();
+      if (!hostId) return alert("ホストIDを入力してください");
+      isHost = false;
+      initPeer();
+      setTimeout(() => { conn = peer.connect(hostId); setupDataConnection(); }, 500);
+    });
+
+    function setupDataConnection() {
+      conn.on('open', () => {
+        setupScreen.style.display = 'none';
+        startGame();
+      });
+
+      conn.on('data', (data) => {
+        if (data.type === 'state') {
+          opponent.x = data.x * canvas.width;
+          oppScore = data.score;
+          document.getElementById('score-opp').innerText = oppScore;
+
+          if (!isHost) {
+            timeLeft = data.timeLeft;
+            timerEl.innerText = timeLeft;
+            if (data.kernels) {
+              kernels = data.kernels.map(k => ({
+                x: k.x * canvas.width,
+                y: k.y * canvas.height,
+                popped: k.popped
+              }));
+            }
+          }
+        }
+      });
+    }
+
+    function handleMove(e) {
+      if (gameOver) return;
+      const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+      const rect = canvas.getBoundingClientRect();
+      player.x = clientX - rect.left;
+    }
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('touchmove', handleMove);
+
+    function spawnKernel() {
+      if (!isHost || gameOver) return;
+      if (Math.random() < 0.04) {
+        kernels.push({
+          x: Math.random() * (canvas.width - 20) + 10,
+          y: canvas.height + 10,
+          vx: (Math.random() - 0.5) * 2,
+          vy: -(Math.random() * 4 + 7),
+          popped: false
+        });
+      }
+    }
+
+    function startGame() {
+      // 1秒ごとにタイマーカウントダウン（ホストのみ管理）
+      if (isHost) {
+        const timerInterval = setInterval(() => {
+          if (timeLeft > 0) {
+            timeLeft--;
+            timerEl.innerText = timeLeft;
+          } else {
+            clearInterval(timerInterval);
+            endGame();
+          }
+        }, 1000);
+      }
+      requestAnimationFrame(update);
+    }
+
+    function endGame() {
+      gameOver = true;
+      resultScreen.style.display = 'flex';
+      const resultTitle = document.getElementById('result-title');
+      const resultDetail = document.getElementById('result-detail');
+
+      if (myScore > oppScore) {
+        resultTitle.innerText = "🎉 VICTORY!";
+        resultTitle.style.color = "#ff5252";
+      } else if (myScore < oppScore) {
+        resultTitle.innerText = "💀 DEFEAT...";
+        resultTitle.style.color = "#448aff";
+      } else {
+        resultTitle.innerText = "DRAW";
+        resultTitle.style.color = "#ffeb3b";
+      }
+      resultDetail.innerText = `YOU: ${myScore} pts  /  OPP: ${oppScore} pts`;
+    }
+
+    function update() {
+      if (conn && conn.open) {
+        const payload = {
+          type: 'state',
+          x: player.x / canvas.width,
+          score: myScore
+        };
+        if (isHost) {
+          payload.timeLeft = timeLeft;
+          payload.kernels = kernels.map(k => ({
+            x: k.x / canvas.width,
+            y: k.y / canvas.height,
+            popped: k.popped
+          }));
+        }
+        conn.send(payload);
+      }
+
+      if (!isHost && timeLeft <= 0 && !gameOver) {
+        endGame();
+      }
+
+      if (isHost && !gameOver) {
+        spawnKernel();
+        for (let i = kernels.length - 1; i >= 0; i--) {
+          let k = kernels[i];
+          k.x += k.vx;
+          k.y += k.vy;
+          k.vy += 0.15;
+
+          if (!k.popped && checkCollision(k, player)) {
+            k.popped = true;
+            k.vy = -5;
+            myScore++;
+            document.getElementById('score-self').innerText = myScore;
+          }
+          if (!k.popped && checkCollision(k, opponent)) {
+            k.popped = true;
+            k.vy = -5;
+            oppScore++;
+            document.getElementById('score-opp').innerText = oppScore;
+          }
+
+          if (k.y > canvas.height + 20) {
+            kernels.splice(i, 1);
+          }
+        }
+      }
+
+      // 描画処理
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      ctx.fillStyle = '#448aff';
+      ctx.fillRect(opponent.x - opponent.width / 2, opponent.y, opponent.width, opponent.height);
+
+      ctx.fillStyle = '#ff5252';
+      ctx.fillRect(player.x - player.width / 2, player.y, player.width, player.height);
+
+      kernels.forEach(k => {
+        ctx.beginPath();
+        if (k.popped) {
+          ctx.fillStyle = '#fff';
+          ctx.arc(k.x, k.y, 10, 0, Math.PI * 2);
+        } else {
+          ctx.fillStyle = '#ffca28';
+          ctx.arc(k.x, k.y, 6, 0, Math.PI * 2);
+        }
+        ctx.fill();
+      });
+
+      if (!gameOver) requestAnimationFrame(update);
+    }
+
+    function checkCollision(k, paddle) {
+      return (
+        k.x > paddle.x - paddle.width / 2 &&
+        k.x < paddle.x + paddle.width / 2 &&
+        k.y > paddle.y &&
+        k.y < paddle.y + paddle.height &&
+        k.vy > 0
+      );
+    }
+  </script>
+</body>
+</html>
